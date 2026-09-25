@@ -216,7 +216,10 @@ sleep 15   # 留时间给你伸手合盖，避免和后面的计时混在一起
 sleep $(( (MINUTES * 60) - 15 ))
 T1=$(NOW)
 
-kill $FR $HB $FL 2>/dev/null; wait 2>/dev/null
+kill $FR $HB $FL 2>/dev/null
+# 只等这三个采样子进程。**裸 `wait` 会连 root 半边一起等**：满格那轮（22:37）就是这样
+# 在窗口结束后又空挂了 3 分钟 —— 还原要等到兜底到期，报告也跟着晚出。
+wait $FR $HB $FL 2>/dev/null
 echo "window_start=$T0" >> "$OUT/meta.txt"
 echo "window_end=$T1" >> "$OUT/meta.txt"
 finalize
