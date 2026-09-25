@@ -22,19 +22,47 @@ TS() { date '+%Y-%m-%d %H:%M:%S'; }
 NOW() { date +%s; }
 VAL() { pmset -g | awk '/SleepDisabled/{print $2; f=1} END{if(!f)print "missing"}'; }
 
-# 同一时间只许跑一轮。上一轮的现象：取消标记在起跑后 13 秒被写过一次，root 半边当场把
+# 同一时间只许跑一轮。21:27 那轮的现象：取消标记在起跑后 13 秒被写过一次，root 半边当场把
 # disablesleep 还原成 0，于是"开着能不能挡住"这一问整程没测到（却顺手证出了坑 #2，见 §7）。
-# **写它的是谁，本机没能复现**（当时只有一个 lidprobe 目录，同秒起两轮是最像的解释）。
-# 不管来源是什么，文件名共享这个洞是真的：两轮同秒起跑会共用同一个取消标记，
+# 当时猜"两轮同秒起跑共用一个标记"，22:09 当场抓到真凶：**是主进程被远程会话断开带走，
+# trap 尽职地写了取消标记**（下面那段自脱终端就是冲它去的）。
+# 但"文件名共享"这个洞本身是真的：两轮同秒起跑确实会共用取消标记，
 # 一轮提前收工就把另一轮的 flag 一起还原了。所以两条都堵：加锁 + 标记按 pid 分开。
 LOCK="$HERE/.run.lock"
-if [ -f "$LOCK" ]; then
-  LPID=$(cat "$LOCK" 2>/dev/null || echo)
-  if [ -n "$LPID" ] && kill -0 "$LPID" 2>/dev/null && ps -o command= -p "$LPID" 2>/dev/null | grep -q lidprobe; then
-    echo "$(TS) 已有一轮在跑（pid $LPID），本次不启动 —— 两轮会互相踩取消标记。"
+lock_busy() {
+  [ -f "$LOCK" ] || return 1
+  local p; p=$(cat "$LOCK" 2>/dev/null || echo)
+  # 不许把自己认成"另一轮"：后台那一半起跑时锁里躺的正是它自己的 pid（前台退出前先占上，
+  # 免得连敲两次命令挤出两轮）。
+  [ "$p" = "$$" ] && return 1
+  [ -n "$p" ] && kill -0 "$p" 2>/dev/null && ps -o command= -p "$p" 2>/dev/null | grep -q lidprobe
+}
+
+# 自己脱离终端再跑。上一轮（22:09）就是这一条救的命：人一合盖、远程会话一断，
+# 挂在那个终端上的主进程被收掉，trap 当场把 disablesleep 还原成 0，
+# 而盖子恰好在那一秒合上 —— 等于"没开保护"，然后被当成"功能不行"。
+# 这个实验的全部前提就是"合盖之后没有任何人再点东西"，所以主进程不许吊在会话上。
+if [ -z "${LIDPROBE_BG:-}" ]; then
+  if lock_busy; then
+    echo "$(TS) 已有一轮在跑（pid $(cat "$LOCK")），本次不启动 —— 两轮会互相踩取消标记。"
     exit 1
   fi
+  ARGS="$MINUTES"
+  [ "$CONTROL" = 1 ] && ARGS="$MINUTES --control"
+  LIDPROBE_BG=1 LIDPROBE_OUT="$OUT" nohup bash "$HERE/lidprobe.sh" $ARGS </dev/null >"$OUT/progress.log" 2>&1 &
+  # 锁先按子进程 pid 占上：前台这一下退出得太快，等子进程自己写会露出一瞬的空档，
+  # 连敲两次命令就能起两轮 —— 那正是取消标记互相踩的成因。子进程起来会重写同一个值。
+  echo $! > "$LOCK"
+  echo "$(TS) 已后台起跑（pid $!）：终端关掉、远程掉线都不影响这一轮。"
+  echo "     进度： tail -f '$OUT/progress.log'"
+  echo "     报告： $OUT/报告.md（跑完自动生成，中途退出也有）"
+  echo "     屏幕上会弹**一次**系统授权框，先点它再合盖。"
+  exit 0
 fi
+# 这一半已经是 nohup 起来的子进程：锁的值由前台按本进程 pid 提前占好，不会再被抢，
+# 所以这里不重查，直接落自己的 pid 继续跑。
+[ -n "${LIDPROBE_OUT:-}" ] && OUT="$LIDPROBE_OUT"
+mkdir -p "$OUT/frames"
 echo $$ > "$LOCK"
 
 BEFORE_ALL() { pmset -g log 2>/dev/null; }
