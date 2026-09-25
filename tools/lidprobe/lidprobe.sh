@@ -73,9 +73,9 @@ FL=$!
 
 echo "$(TS) 基线：SleepDisabled=$BASE_SLEEP，历史 Clamshell Sleep 事件 $CLAM_BEFORE 条"
 if [ "$CONTROL" = 1 ]; then
-  echo "$(TS) 对照组：请在 15 秒内合上盖子，等满 ${MINUTES} 分钟再打开。"
+  echo "$(TS) 对照组：请在 15 秒内合上盖子，**全程保持合上**满 ${MINUTES} 分钟再打开（中途开盖本次作废）。"
 else
-  echo "$(TS) 现在开启 disablesleep。请在 15 秒内合上盖子，等满 ${MINUTES} 分钟再打开。"
+  echo "$(TS) 现在开启 disablesleep。请在 15 秒内合上盖子，**全程保持合上**满 ${MINUTES} 分钟再打开（中途开盖本次作废）。"
   sudo pmset -a disablesleep 1 || { echo "开不了 disablesleep，测不下去。"; exit 1; }
   pmset -g | grep SleepDisabled
 fi
@@ -92,6 +92,12 @@ FLAG_MIN=$(awk '$3!=""{if(m==""||$3+0<m+0)m=$3} END{print (m==""?"none":m)}' "$O
 FLAG_FLIPS=$(awk '$3!=""{if(s!=""&&$3!=s)n++; s=$3} END{print n+0}' "$OUT/flag.tsv" 2>/dev/null)
 LID_YES=$(awk '$2=="Yes"' "$OUT/flag.tsv" 2>/dev/null | wc -l | tr -d ' ')
 LID_SECS=$((LID_YES * 2))
+# 合盖时长不足一样不作数：只合两秒钟，机器根本没来得及走完睡眠流程。
+# 第二轮对照就是这样 —— 89 个采样里只有 1 个 Yes，零睡眠事件，
+# 这不能算"判据看不见"，只能算"这次没测"。
+REQUIRED=$(( (MINUTES * 60 - 15) * 80 / 100 ))
+LID_ENOUGH=1
+[ "$LID_SECS" -lt "$REQUIRED" ] && LID_ENOUGH=0
 restore
 
 CLAM_AFTER=$(BEFORE); IDLE_AFTER=$(BEFORE_IDLE)
@@ -103,6 +109,8 @@ FRAMES_FAIL=$(awk '$2=="fail"' "$OUT/frames.tsv" 2>/dev/null | wc -l | tr -d ' '
 
 if [ "$LID_YES" -eq 0 ]; then
   VERDICT="本次不作数：盖子全程没合上过（合盖采样 0 次）。别用这个结果下任何结论"
+elif [ "$LID_ENOUGH" = 0 ]; then
+  VERDICT="本次不作数：合盖时长不足，实测约 ${LID_SECS}s / 要求 ≥ ${REQUIRED}s。只合一两秒机器根本来不及走完睡眠流程，这不叫判据失灵，叫这次没测"
 elif [ "$CONTROL" = 1 ]; then
   # 对照组不评价 disablesleep，只评价"这套判据能不能看见一次真实的合盖睡眠"。
   if [ "$NEW_IDLE" -gt 0 ]; then
@@ -128,7 +136,7 @@ cat > "$OUT/报告.md" <<EOF
 
 - 计时窗口：$(date -r "$T0" '+%H:%M:%S') → $(date -r "$T1" '+%H:%M:%S')（${MINUTES} 分钟）
 - SleepDisabled：基线 $BASE_SLEEP，$CHANGED（当前 $(pmset -g | awk '/SleepDisabled/{print $2}')）
-- 盖子状态：采样 $FLAG_SAMPLES 次，其中合上 **$LID_YES 次 ≈ $LID_SECS 秒**
+- 盖子状态：采样 $FLAG_SAMPLES 次，其中合上 **$LID_YES 次 ≈ $LID_SECS 秒**（要求 ≥ ${REQUIRED}s，判定 $(if [ "$LID_ENOUGH" = 1 ]; then echo 达标; else echo "不达标，本次不作数"; fi)）
 - 合盖期间 SleepDisabled 取值：最小 **$FLAG_MIN**，窗口内变化 **$FLAG_FLIPS** 次（掉回 0 = 被系统重置，不等于挡不住）
 - Clamshell Sleep 事件：$CLAM_BEFORE → $CLAM_AFTER（新增 **$NEW_CLAM**）
 - 进入睡眠事件（全部原因）：新增 **$NEW_IDLE**
