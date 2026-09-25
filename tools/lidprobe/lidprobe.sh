@@ -20,36 +20,46 @@ mkdir -p "$OUT/frames"
 TS() { date '+%Y-%m-%d %H:%M:%S'; }
 NOW() { date +%s; }
 
-# 提权走两条路，先试免密的，不行就弹系统授权框（= §4 里产品要用的那条路）。
-# 为什么必须有第二条：跑脚本的人可能正在远程会话里，命令行里的 sudo 提示他根本看不见，
-# 而系统弹窗会出现在他屏幕上、能点能输。取消弹窗就当整次实验作废，绝不带着半开状态跑下去。
-AS_ROOT=0
-as_root() {
-  if [ "$AS_ROOT" = 1 ]; then
-    osascript -e "do shell script \"$*\" with administrator privileges"
-  else
-    sudo bash -c "$*"
-  fi
-}
-
+# 提权只问一次，而且问的那一下就把「开 → 到期 → 还原 → 合盖补睡」整条交给 root 子进程去做。
+# 为什么不是一句 sudo 一句 osascript 拼起来：还原那一步若还要弹第二次窗，
+# 而那时人已经合盖走开（或就是在远程会话里点的），弹窗没人点，
+# disablesleep 就永远留在 1 —— 这个洞比"开不起来"严重得多，§2.2 守卫明令禁止它。
+# 命令行里的 sudo 提示远程的人根本看不见，所以首选系统弹窗（= §4 里产品要用的那条路）。
 if [ "$CONTROL" = 1 ]; then
   restore() { :; }
   echo "$(TS) 对照组：不改任何电源设置，只测判据本身。"
 else
+  CANCEL="$OUT/cancel"; rm -f "$CANCEL"
+  # ROOT_END 只是兜底上限，正常收尾走两条快路：父进程写 CANCEL，或父进程没了（kill -9）。
+  ROOT_END=$(( $(NOW) + MINUTES * 60 + 600 ))
   if sudo -n true 2>/dev/null; then
-    echo "$(TS) 已有免密 sudo 票据，直接用它。"
+    echo "$(TS) 已有免密 sudo 票据，用它起 root 半边。"
+    sudo bash "$HERE/lidroot.sh" "$ROOT_END" "$CANCEL" "$$" > "$OUT/root.log" 2>&1 &
   else
-    AS_ROOT=1
-    echo "$(TS) 屏幕上会弹一个系统授权框（要改 pmset），请在弹窗里输密码；取消则本次不跑。"
-    osascript -e 'do shell script "true" with administrator privileges' >/dev/null || {
-      echo "$(TS) 授权没拿到，退出。机器状态未改动。"; exit 1; }
-    echo "$(TS) 授权已拿到。"
+    echo "$(TS) 屏幕上会弹**一次**系统授权框 —— 这一次授权同时负责开和还原，中途不再问第二遍。"
+    osascript -e "do shell script \"bash '$HERE/lidroot.sh' $ROOT_END '$CANCEL' '$$'\" with administrator privileges" \
+      > "$OUT/root.log" 2>&1 &
   fi
-  RESTORED=0
+  ROOTJOB=$!
+  VAL() { pmset -g | awk '/SleepDisabled/{print $2; f=1} END{if(!f)print "missing"}'; }
+  for _ in $(seq 1 90); do
+    [ "$(VAL)" = "1" ] && break
+    kill -0 "$ROOTJOB" 2>/dev/null || break
+    sleep 1
+  done
+  if [ "$(VAL)" != "1" ]; then
+    echo "$(TS) 没开起来（授权没给 / 被取消 / 超过 90 秒没人点窗）。本次不跑，机器状态未改动。"
+    # 留个取消标记：万一人是在 90 秒之后才点的，root 半边一看到标记就还原并收工，
+    # 不会把 SleepDisabled=1 一直攥到兜底到期。
+    [ -f "$CANCEL" ] || touch "$CANCEL"
+    wait "$ROOTJOB" 2>/dev/null; cat "$OUT/root.log" 2>/dev/null | sed 's/^/    /'
+    exit 1
+  fi
+  echo "$(TS) 已开启，SleepDisabled=$(VAL)。"
   restore() {
-    [ "$RESTORED" = 1 ] && return
-    RESTORED=1
-    as_root "pmset -a disablesleep 0" && echo "$(TS) 已还原 disablesleep=0"
+    [ -f "$CANCEL" ] || touch "$CANCEL"
+    wait "$ROOTJOB" 2>/dev/null
+    echo "$(TS) root 半边已收工，当前 SleepDisabled=$(VAL)"
   }
   trap 'restore; exit 130' INT TERM
   trap restore EXIT
@@ -65,14 +75,22 @@ IDLE_BEFORE=$(BEFORE_IDLE)
 { echo "started$(TS)"; echo "base_SleepDisabled=$BASE_SLEEP"; echo "clamshell_events_before=$CLAM_BEFORE"; } > "$OUT/meta.txt"
 
 # 心跳：每秒一条。睡过去就会断档，断档秒数即"睡了三分钟还是只打了个盹"。
-( while :; do echo "$(date +%s.%N) $(NOW)"; sleep 1; done > "$OUT/heartbeat.tsv" ) &
+# 三个采样循环都带硬到期：上一轮主进程卡在授权弹窗上、没走到收尾的 kill，
+# 采样子进程就在后台空转了 8 分钟、多写了几十张全屏图。采样必须自己会停。
+DEADLINE=$(( $(NOW) + MINUTES * 60 + 120 ))
+( while [ "$(date +%s)" -lt "$DEADLINE" ]; do echo "$(date +%s.%N) $(NOW)"; sleep 1; done > "$OUT/heartbeat.tsv" ) &
 HB=$!
 # 抓屏循环：证明显示管线在盖子合上后还活着（§2.3 的口径，这里只记"成不成功 + 文件多大"）。
-( n=0; while [ $n -lt 9999 ]; do
-    n=$((n+1)); t=$(date +%s.%N)
-    if screencapture -x -t png "$OUT/frames/f$(printf %04d $n).png" 2>"$OUT/frames/err.txt"; then
-      s=$(stat -f%z "$OUT/frames/f$(printf %04d $n).png" 2>/dev/null || echo 0)
+# 每张全屏 PNG ≈ 5MB，本机实测一轮就吃掉 268MB —— 所以只按大小记账，
+# 图片每 6 次（≈30 秒）留一张够人工回看，其余抓完即删；循环按窗口时长封顶，不许无限跑。
+FRAME_MAX=$(( (MINUTES * 60) / 5 + 12 ))
+( n=0
+  while [ $n -lt "$FRAME_MAX" ]; do
+    n=$((n+1)); t=$(date +%s.%N); f="$OUT/frames/f$(printf %04d $n).png"
+    if screencapture -x -t png "$OUT/frames/.cur.png" 2>"$OUT/frames/err.txt"; then
+      s=$(stat -f%z "$OUT/frames/.cur.png" 2>/dev/null || echo 0)
       echo "$t ok $s"
+      if [ $((n % 6)) -eq 1 ]; then mv "$OUT/frames/.cur.png" "$f"; else rm -f "$OUT/frames/.cur.png"; fi
     else
       echo "$t fail 0"
     fi >> "$OUT/frames.tsv"
@@ -85,7 +103,7 @@ FR=$!
 #  ② SleepDisabled 取值：二手证据里最要紧的风险是苹果会在电源/显示拓扑变化时
 #     把它悄悄改回 0（有项目为此每 2 秒重设一次）。不盯这一项，
 #     "还是睡过去了"就可能是被重置导致的，而不是 disablesleep 挡不住。
-( while :; do
+( while [ "$(date +%s)" -lt "$DEADLINE" ]; do
     echo "$(NOW) $(ioreg -r -k AppleClamshellState -d 1 2>/dev/null | awk -F'= ' '/AppleClamshellState/{gsub(/[ "]/,"",$2); print $2; exit}') $(pmset -g | awk '/SleepDisabled/{print $2}')"
     sleep 2
   done > "$OUT/flag.tsv" ) &
@@ -95,9 +113,7 @@ echo "$(TS) 基线：SleepDisabled=$BASE_SLEEP，历史 Clamshell Sleep 事件 $
 if [ "$CONTROL" = 1 ]; then
   echo "$(TS) 对照组：请在 15 秒内合上盖子，**全程保持合上**满 ${MINUTES} 分钟再打开（中途开盖本次作废）。"
 else
-  echo "$(TS) 现在开启 disablesleep。请在 15 秒内合上盖子，**全程保持合上**满 ${MINUTES} 分钟再打开（中途开盖本次作废）。"
-  as_root "pmset -a disablesleep 1" || { echo "开不了 disablesleep，测不下去。"; exit 1; }
-  pmset -g | grep SleepDisabled
+  echo "$(TS) 已经开着了。请在 15 秒内合上盖子，**全程保持合上**满 ${MINUTES} 分钟再打开（中途开盖本次作废）。"
 fi
 T0=$(NOW)
 sleep 15   # 留时间给你伸手合盖，避免和后面的计时混在一起
@@ -184,18 +200,6 @@ EOF
 echo "$(TS) $VERDICT"
 echo "$(TS) 报告：$OUT/报告.md"
 
-# 一条容易漏的坑（来自 Amphetamine 侧的实测报告）：盖子还合着时把 disablesleep 写回 0，
-# 苹果不会补睡一次（XNU 清了标志但不重算合盖事件）。
-# 于是这台机器会带着"合盖不睡"的状态在包里一直跑到没电 —— 而 §2.2 的守卫承诺恰恰是"不许这样"。
-# 所以还原后如果盖子还合着，必须主动补一次 sleepnow，否则守卫是假的。留 10 秒开盖反悔窗口。
-if [ "$CONTROL" != 1 ] && [ "$(ioreg -r -k AppleClamshellState -d 1 2>/dev/null | awk -F'= ' '/AppleClamshellState/{gsub(/[ "]/,"",$2); print $2; exit}')" = "Yes" ]; then
-  echo "!! 退出时盖子仍是合上的，而 disablesleep 已还原为 0 —— 苹果不会补睡，这台机器会醒着待在包里。"
-  echo "!! 10 秒内开盖可取消；否则本脚本再弹一次授权框，替它执行 pmset sleepnow。"
-  sleep 10
-  if [ "$(ioreg -r -k AppleClamshellState -d 1 2>/dev/null | awk -F'= ' '/AppleClamshellState/{gsub(/[ "]/,"",$2); print $2; exit}')" = "Yes" ]; then
-    echo "$(TS) 盖子仍合着，执行 sleepnow"
-    as_root "pmset sleepnow"
-  else
-    echo "$(TS) 已开盖，不补睡"
-  fi
-fi
+# "还原时盖子还合着 → 苹果不补睡 → 机器醒着待在包里"这条坑由 lidroot.sh 那半边负责：
+# 它在同一次授权里检测退出时的盖子状态，仍合着就补一次 sleepnow（留 10 秒开盖反悔）。
+# 放在 root 半边是因为这里要真执行 sleepnow —— 父进程自己再提一次权，就等于又弹一次没人点的窗。
