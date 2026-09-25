@@ -6,6 +6,7 @@
 #   不带 --control = 实验组（开 disablesleep，跑完无条件还原 0）
 #   带   --control = 对照组（什么都不改，用来证明这套判据"睡得着的时候确实报得出来"）
 # 中途退出/断网都会把 disablesleep 还原回 0。
+# 结论不在这个脚本里算，交给同目录 analyze.sh —— 它只读盘，随时可重算。
 
 set -u
 MINUTES="${1:-3}"
@@ -19,17 +20,76 @@ mkdir -p "$OUT/frames"
 
 TS() { date '+%Y-%m-%d %H:%M:%S'; }
 NOW() { date +%s; }
+VAL() { pmset -g | awk '/SleepDisabled/{print $2; f=1} END{if(!f)print "missing"}'; }
+
+# 同一时间只许跑一轮。上一轮的现象：取消标记在起跑后 13 秒被写过一次，root 半边当场把
+# disablesleep 还原成 0，于是"开着能不能挡住"这一问整程没测到（却顺手证出了坑 #2，见 §7）。
+# **写它的是谁，本机没能复现**（当时只有一个 lidprobe 目录，同秒起两轮是最像的解释）。
+# 不管来源是什么，文件名共享这个洞是真的：两轮同秒起跑会共用同一个取消标记，
+# 一轮提前收工就把另一轮的 flag 一起还原了。所以两条都堵：加锁 + 标记按 pid 分开。
+LOCK="$HERE/.run.lock"
+if [ -f "$LOCK" ]; then
+  LPID=$(cat "$LOCK" 2>/dev/null || echo)
+  if [ -n "$LPID" ] && kill -0 "$LPID" 2>/dev/null && ps -o command= -p "$LPID" 2>/dev/null | grep -q lidprobe; then
+    echo "$(TS) 已有一轮在跑（pid $LPID），本次不启动 —— 两轮会互相踩取消标记。"
+    exit 1
+  fi
+fi
+echo $$ > "$LOCK"
+
+BEFORE_ALL() { pmset -g log 2>/dev/null; }
+
+# 基线必须在提权**之前**落盘。上一轮的 meta 写着 base_SleepDisabled=1，
+# 那是我们自己刚设上去的值，不是基线 —— 顺序反了就等于自己给自己造基线。
+# `pmset -g log` 一次就要 10 秒（本机实测），所以只抓一次、两个计数都从这一份里数。
+BASE_SLEEP=$(VAL)
+PMSET_LOG=$(BEFORE_ALL)
+CLAM_BEFORE=$(printf '%s\n' "$PMSET_LOG" | grep -c "due to 'Clamshell Sleep'")
+IDLE_BEFORE=$(printf '%s\n' "$PMSET_LOG" | grep -c "Entering Sleep state")
+{ echo "started_ts=$(TS)"
+  echo "started_epoch=$(NOW)"
+  echo "minutes=$MINUTES"
+  echo "control=$CONTROL"
+  echo "base_SleepDisabled=$BASE_SLEEP"
+  echo "clamshell_events_before=$CLAM_BEFORE"
+  echo "idle_events_before=$IDLE_BEFORE"
+  echo "pid=$$"; } > "$OUT/meta.txt"
 
 # 提权只问一次，而且问的那一下就把「开 → 到期 → 还原 → 合盖补睡」整条交给 root 子进程去做。
 # 为什么不是一句 sudo 一句 osascript 拼起来：还原那一步若还要弹第二次窗，
 # 而那时人已经合盖走开（或就是在远程会话里点的），弹窗没人点，
 # disablesleep 就永远留在 1 —— 这个洞比"开不起来"严重得多，§2.2 守卫明令禁止它。
 # 命令行里的 sudo 提示远程的人根本看不见，所以首选系统弹窗（= §4 里产品要用的那条路）。
+ROOTJOB=""
+RESTORED=0
+FINALIZED=0
+restore() {
+  [ "$RESTORED" = 1 ] && return
+  RESTORED=1
+  [ -n "$ROOTJOB" ] || return
+  [ -f "$CANCEL" ] || touch "$CANCEL"
+  wait "$ROOTJOB" 2>/dev/null
+  echo "$(TS) root 半边已收工，当前 SleepDisabled=$(VAL)"
+}
+# 收尾只做一次：还原 → 放锁 → 交给 analyze.sh 算结论。
+# 放在 finalize 里而不是一行行摊在末尾，是因为上一轮主进程提前退出时，
+# 采样数据全在盘上却一个字报告都没有 —— 早退也必须留痕。
+finalize() {
+  [ "$FINALIZED" = 1 ] && return
+  FINALIZED=1
+  restore
+  rm -f "$LOCK"
+  bash "$HERE/analyze.sh" "$OUT" $([ "$CONTROL" = 1 ] && echo --control)
+}
+trap 'finalize; exit 130' INT TERM
+# HUP 也要接住：终端一关、远程会话一断，默认动作是直接收掉进程，
+# 那样 disablesleep 就被攥在 1 里没人还原 —— 这条和"弹窗没人点"是同一类洞。
+trap 'finalize; exit 129' HUP
+trap 'finalize' EXIT
 if [ "$CONTROL" = 1 ]; then
-  restore() { :; }
   echo "$(TS) 对照组：不改任何电源设置，只测判据本身。"
 else
-  CANCEL="$OUT/cancel"; rm -f "$CANCEL"
+  CANCEL="$OUT/cancel.$$"; rm -f "$CANCEL"
   # ROOT_END 只是兜底上限，正常收尾走两条快路：父进程写 CANCEL，或父进程没了（kill -9）。
   ROOT_END=$(( $(NOW) + MINUTES * 60 + 600 ))
   if sudo -n true 2>/dev/null; then
@@ -41,7 +101,6 @@ else
       > "$OUT/root.log" 2>&1 &
   fi
   ROOTJOB=$!
-  VAL() { pmset -g | awk '/SleepDisabled/{print $2; f=1} END{if(!f)print "missing"}'; }
   for _ in $(seq 1 90); do
     [ "$(VAL)" = "1" ] && break
     kill -0 "$ROOTJOB" 2>/dev/null || break
@@ -51,28 +110,22 @@ else
     echo "$(TS) 没开起来（授权没给 / 被取消 / 超过 90 秒没人点窗）。本次不跑，机器状态未改动。"
     # 留个取消标记：万一人是在 90 秒之后才点的，root 半边一看到标记就还原并收工，
     # 不会把 SleepDisabled=1 一直攥到兜底到期。
-    [ -f "$CANCEL" ] || touch "$CANCEL"
-    wait "$ROOTJOB" 2>/dev/null; cat "$OUT/root.log" 2>/dev/null | sed 's/^/    /'
+    restore
+    cat "$OUT/root.log" 2>/dev/null | sed 's/^/    /'
+    # 这一轮没有采样数据可算（整轮没起跑），所以手写一份"为什么没跑"的报告，
+    # 不叫 analyze.sh 去对空目录编结论。
+    FINALIZED=1
+    { echo "# 本轮未起跑 $(TS)"
+      echo
+      echo "原因：授权没给 / 被取消 / 90 秒内没人点窗。采样循环还没起，所以目录里没有 heartbeat/flag/frames。"
+      echo "机器状态：SleepDisabled=$(VAL)（未改动，或已按取消标记还原）。"
+      echo "root 半边输出："; sed 's/^/    /' "$OUT/root.log" 2>/dev/null; } > "$OUT/报告.md"
+    echo "$(TS) 报告：$OUT/报告.md"
+    rm -f "$LOCK"
     exit 1
   fi
   echo "$(TS) 已开启，SleepDisabled=$(VAL)。"
-  restore() {
-    [ -f "$CANCEL" ] || touch "$CANCEL"
-    wait "$ROOTJOB" 2>/dev/null
-    echo "$(TS) root 半边已收工，当前 SleepDisabled=$(VAL)"
-  }
-  trap 'restore; exit 130' INT TERM
-  trap restore EXIT
 fi
-
-BEFORE() { pmset -g log 2>/dev/null | grep -c "due to 'Clamshell Sleep'"; }
-BEFORE_IDLE() { pmset -g log 2>/dev/null | grep -c "Entering Sleep state"; }
-
-BASE_SLEEP=$(pmset -g | awk '/SleepDisabled/{print $2; found=1} END{if(!found)print "missing"}')
-CLAM_BEFORE=$(BEFORE)
-IDLE_BEFORE=$(BEFORE_IDLE)
-
-{ echo "started$(TS)"; echo "base_SleepDisabled=$BASE_SLEEP"; echo "clamshell_events_before=$CLAM_BEFORE"; } > "$OUT/meta.txt"
 
 # 心跳：每秒一条。睡过去就会断档，断档秒数即"睡了三分钟还是只打了个盹"。
 # 三个采样循环都带硬到期：上一轮主进程卡在授权弹窗上、没走到收尾的 kill，
@@ -81,16 +134,17 @@ DEADLINE=$(( $(NOW) + MINUTES * 60 + 120 ))
 ( while [ "$(date +%s)" -lt "$DEADLINE" ]; do echo "$(date +%s.%N) $(NOW)"; sleep 1; done > "$OUT/heartbeat.tsv" ) &
 HB=$!
 # 抓屏循环：证明显示管线在盖子合上后还活着（§2.3 的口径，这里只记"成不成功 + 文件多大"）。
-# 每张全屏 PNG ≈ 5MB，本机实测一轮就吃掉 268MB —— 所以只按大小记账，
-# 图片每 6 次（≈30 秒）留一张够人工回看，其余抓完即删；循环按窗口时长封顶，不许无限跑。
+# 每张全屏 PNG ≈ 2–5MB，上一轮吃掉 268MB —— 所以只按大小记账，每 6 张留一张够人工回看。
+# 临时文件名**不能以点开头**：`screencapture` 拒写点文件却照样退出 0（本机实测），
+# 所以下面除了看返回码，还必须看文件真在不在。
 FRAME_MAX=$(( (MINUTES * 60) / 5 + 12 ))
 ( n=0
   while [ $n -lt "$FRAME_MAX" ]; do
-    n=$((n+1)); t=$(date +%s.%N); f="$OUT/frames/f$(printf %04d $n).png"
-    if screencapture -x -t png "$OUT/frames/.cur.png" 2>"$OUT/frames/err.txt"; then
-      s=$(stat -f%z "$OUT/frames/.cur.png" 2>/dev/null || echo 0)
-      echo "$t ok $s"
-      if [ $((n % 6)) -eq 1 ]; then mv "$OUT/frames/.cur.png" "$f"; else rm -f "$OUT/frames/.cur.png"; fi
+    n=$((n+1)); t=$(date +%s.%N); tmp="$OUT/frames/cur.png"
+    screencapture -x -t png "$tmp" 2>"$OUT/frames/err.txt"
+    if [ -s "$tmp" ]; then
+      echo "$t ok $(stat -f%z "$tmp")"
+      if [ $((n % 6)) -eq 1 ]; then mv "$tmp" "$OUT/frames/f$(printf %04d $n).png"; else rm -f "$tmp"; fi
     else
       echo "$t fail 0"
     fi >> "$OUT/frames.tsv"
@@ -100,9 +154,9 @@ FR=$!
 # 全程盯两件事，每 2 秒一行：`epoch 盖子状态 SleepDisabled取值`
 #  ① 盖子状态：不采这一项，"没睡"有可能只是"盖子根本没合上"，实验白跑。
 #     （本机实测 `ioreg -r -k AppleClamshellState` 免密可读，开盖为 No）
-#  ② SleepDisabled 取值：二手证据里最要紧的风险是苹果会在电源/显示拓扑变化时
-#     把它悄悄改回 0（有项目为此每 2 秒重设一次）。不盯这一项，
-#     "还是睡过去了"就可能是被重置导致的，而不是 disablesleep 挡不住。
+#  ② SleepDisabled 取值：苹果会在电源/显示拓扑变化时把它悄悄改回 0（二手证据里最要紧的坑）。
+#     不盯这一项，"还是睡过去了"就可能是被重置导致的，而不是 disablesleep 挡不住。
+#     上一轮还多证出一条：**合盖那一刻的取值才是关键**，所以这一列一行都不能少。
 ( while [ "$(date +%s)" -lt "$DEADLINE" ]; do
     echo "$(NOW) $(ioreg -r -k AppleClamshellState -d 1 2>/dev/null | awk -F'= ' '/AppleClamshellState/{gsub(/[ "]/,"",$2); print $2; exit}') $(pmset -g | awk '/SleepDisabled/{print $2}')"
     sleep 2
@@ -121,85 +175,6 @@ sleep $(( (MINUTES * 60) - 15 ))
 T1=$(NOW)
 
 kill $FR $HB $FL 2>/dev/null; wait 2>/dev/null
-
-# 先把盯梢结果算出来，再还原 —— 顺序反了会把"收尾那一下"当成系统自己改的。
-# 只看**盖子合着那一段**的取值。全窗口统计会自己骗自己：
-# 盯梢循环比 `disablesleep 1` 早起步几秒，那几秒天然是 0，
-# 于是"被系统重置了 1 次"是假的 —— 第一次实验组就是这么被脏了一行的。
-FLAG_SAMPLES=$(awk '$2=="Yes"' "$OUT/flag.tsv" 2>/dev/null | wc -l | tr -d ' ')
-FLAG_MIN=$(awk '$2=="Yes"&&$3!=""{if(m==""||$3+0<m+0)m=$3} END{print (m==""?"none":m)}' "$OUT/flag.tsv" 2>/dev/null)
-FLAG_FLIPS=$(awk '$2=="Yes"&&$3!=""{if(s!=""&&$3!=s)n++; s=$3} END{print n+0}' "$OUT/flag.tsv" 2>/dev/null)
-LID_YES=$(awk '$2=="Yes"' "$OUT/flag.tsv" 2>/dev/null | wc -l | tr -d ' ')
-LID_SECS=$((LID_YES * 2))
-# 门槛按时长分档，不是一刀切作废：对照组实测"合盖→真睡着"的延迟只有 ≤4 秒，
-# 所以合盖 30 秒以上仍零睡眠事件，已经是十几倍于延迟的正证据，只是窗口没跑满；
-# 而只合一两秒（第二轮对照那样）确实什么都没测到。
-REQUIRED=$(( (MINUTES * 60 - 15) * 80 / 100 ))
-LID_ENOUGH=1; TIER="满格"
-if [ "$LID_SECS" -lt "$REQUIRED" ]; then TIER="短时（未达满格 $REQUIRED 秒）"; fi
-[ "$LID_SECS" -lt 30 ] && LID_ENOUGH=0
-restore
-
-CLAM_AFTER=$(BEFORE); IDLE_AFTER=$(BEFORE_IDLE)
-NEW_CLAM=$((CLAM_AFTER - CLAM_BEFORE))
-NEW_IDLE=$((IDLE_AFTER - IDLE_BEFORE))
-GAP=$(awk 'NR>1{d=$2-p; if(d>g)g=d} {p=$2} END{printf "%d", g+0}' "$OUT/heartbeat.tsv")
-FRAMES_OK=$(awk '$2=="ok"' "$OUT/frames.tsv" 2>/dev/null | wc -l | tr -d ' ')
-FRAMES_FAIL=$(awk '$2=="fail"' "$OUT/frames.tsv" 2>/dev/null | wc -l | tr -d ' ')
-
-if [ "$LID_YES" -eq 0 ]; then
-  VERDICT="本次不作数：盖子全程没合上过（合盖采样 0 次）。别用这个结果下任何结论"
-elif [ "$LID_ENOUGH" = 0 ]; then
-  VERDICT="本次不作数：合盖时长只有约 ${LID_SECS}s，低于 30 秒下限。对照实测合盖→睡着的延迟只有几秒，这么短根本什么都没测到"
-elif [ "$CONTROL" = 1 ]; then
-  # 对照组不评价 disablesleep，只评价"这套判据能不能看见一次真实的合盖睡眠"。
-  if [ "$NEW_IDLE" -gt 0 ]; then
-    VERDICT="对照组按预期睡过去了：窗口内新增 $NEW_IDLE 次睡眠事件（其中 Clamshell $NEW_CLAM），判据可用"
-  else
-    VERDICT="对照组窗口内一次睡眠都没有 —— 要么盖子没合上，要么判据看不见合盖睡眠。这两种情况下实验组的结果都不作数"
-  fi
-elif [ "$NEW_IDLE" -eq 0 ] && [ "$GAP" -le 5 ]; then
-  VERDICT="挡住合盖了：合盖 ${LID_SECS}s 内零次进睡眠、心跳无断档、SleepDisabled 未回落（时长档位：$TIER）"
-elif [ "$NEW_IDLE" -eq 0 ]; then
-  VERDICT="没进睡眠但心跳断档 ${GAP}s —— 计时被冻过，去看 flag.tsv 与系统日志再定性"
-elif [ "$NEW_CLAM" -gt 0 ] && [ "$FLAG_MIN" = "0" ]; then
-  VERDICT="不能判定「挡不住」：窗口内 SleepDisabled 自己掉回 0（最小值 $FLAG_MIN、变化 $FLAG_FLIPS 次）之后才睡的。这测的是「会不会被系统重置」，不是「disablesleep 挡不挡得住」，得先加重设循环再测"
-elif [ "$NEW_CLAM" -gt 0 ]; then
-  VERDICT="没挡住：窗口内新增 $NEW_CLAM 次 Clamshell Sleep，且全程 SleepDisabled 未回落（最小值 $FLAG_MIN）"
-else
-  VERDICT="窗口内新增 $NEW_IDLE 次睡眠事件（Clamshell $NEW_CLAM），心跳最大断档 ${GAP}s"
-fi
-
-if [ "$CONTROL" = 1 ]; then CHANGED="对照组，全程未改动"; else CHANGED="实验期置 1、收尾还原 0"; fi
-cat > "$OUT/报告.md" <<EOF
-# 合盖实测报告 $(TS)　$([ "$CONTROL" = 1 ] && echo "对照组" || echo "实验组")
-
-- 计时窗口：$(date -r "$T0" '+%H:%M:%S') → $(date -r "$T1" '+%H:%M:%S')（${MINUTES} 分钟）
-- SleepDisabled：基线 $BASE_SLEEP，$CHANGED（当前 $(pmset -g | awk '/SleepDisabled/{print $2}')）
-- 盖子状态：合上采样 $FLAG_SAMPLES 次 ≈ $LID_SECS 秒（满格需 ≥ ${REQUIRED}s，本次档位：$TIER；$([ "$LID_ENOUGH" = 1 ] && echo "达标，可用" || echo "低于 30 秒下限，本次不作数")）
-- 合盖期间 SleepDisabled 取值：最小 **$FLAG_MIN**，取值变化 **$FLAG_FLIPS** 次（掉回 0 = 被系统重置，不等于挡不住）
-- Clamshell Sleep 事件：$CLAM_BEFORE → $CLAM_AFTER（新增 **$NEW_CLAM**）
-- 进入睡眠事件（全部原因）：新增 **$NEW_IDLE**
-- 心跳最大断档：**${GAP}s**
-- 抓屏：成功 $FRAMES_OK 次 / 失败 $FRAMES_FAIL 次
-
-## 结论
-**$VERDICT**
-
-## 需要人工补一行
-- 远程会话（控境/屏幕共享/SSH）这段时间断过没有：______
-  这条是产品口径，不是机制口径 —— 日志能证明"内核有没有睡"，但客户只关心"我远程还连不连得上"。
-  两者可能不一致：合盖后掉线也可能是显示/网卡被关而机器并没睡，那种情况下 disablesleep 修不好它。
-
-## 判据说明
-'Clamshell Sleep' 是这台机器自己日志里的原话（实测 09-21 开机以来已有 $CLAM_BEFORE 条），
-不是我造的口径。所以本实验不需要人判断"好像没睡"，只看这条计数有没有在窗口内涨。
-
-原始材料：heartbeat.tsv / frames.tsv / frames/ / meta.txt，都在本目录。
-EOF
-echo "$(TS) $VERDICT"
-echo "$(TS) 报告：$OUT/报告.md"
-
-# "还原时盖子还合着 → 苹果不补睡 → 机器醒着待在包里"这条坑由 lidroot.sh 那半边负责：
-# 它在同一次授权里检测退出时的盖子状态，仍合着就补一次 sleepnow（留 10 秒开盖反悔）。
-# 放在 root 半边是因为这里要真执行 sleepnow —— 父进程自己再提一次权，就等于又弹一次没人点的窗。
+echo "window_start=$T0" >> "$OUT/meta.txt"
+echo "window_end=$T1" >> "$OUT/meta.txt"
+finalize
