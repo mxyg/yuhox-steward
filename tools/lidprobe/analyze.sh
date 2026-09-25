@@ -83,7 +83,7 @@ if [ "$HAS_LID" = 0 ]; then
   if [ "$NEW_CLAM" -gt 0 ]; then
     VERDICT="这一轮没有盖子采样文件（早于 flag.tsv 传感器），但窗口内出现 $NEW_CLAM 条 Clamshell Sleep、心跳断档 ${GAP}s —— 这类事件只有真合上盖才记，所以「合过盖」由事件本身成立。判据在这一轮是：$([ "$CONTROL" = 1 ] && echo "对照组确实睡过去了，判据可用" || echo "实验组仍睡过去了，说明没挡住")"
   else
-    VERDICT="这一轮**没有盖子采样文件**（早于 flag.tsv 传感器），所以「合没合上、合了多久」无法自证：窗口内 Clamshell 新增 $NEW_CLAM、进睡眠新增 $NEW_IDLE、心跳最大断档 ${GAP}s。这组数只能当「没检测到睡眠」用，不能当「挡住了睡眠」用"
+    VERDICT="这一轮**没有盖子采样文件**（早于 flag.tsv 传感器），所以「合没合上、合了多久」无法自证：窗口内 Clamshell 新增 ${NEW_CLAM}、进睡眠新增 ${NEW_IDLE}、心跳最大断档 ${GAP}s。这组数只能当「没检测到睡眠」用，不能当「挡住了睡眠」用"
   fi
 elif [ "$LID_YES" -eq 0 ]; then
   VERDICT="本次不作数：盖子全程没合上过（合盖采样 0 次）。别用这个结果下任何结论"
@@ -91,20 +91,20 @@ elif [ "$LID_ENOUGH" = 0 ]; then
   VERDICT="本次不作数：合盖时长只有约 ${LID_SECS}s，低于 30 秒下限。对照实测合盖→睡着的延迟只有几秒，这么短根本什么都没测到"
 elif [ "$CONTROL" = 1 ]; then
   if [ "$NEW_IDLE" -gt 0 ]; then
-    VERDICT="对照组按预期睡过去了：窗口内新增 $NEW_IDLE 次睡眠事件（其中 Clamshell $NEW_CLAM），判据可用"
+    VERDICT="对照组按预期睡过去了：窗口内新增 $NEW_IDLE 次睡眠事件（其中 Clamshell ${NEW_CLAM}），判据可用"
   else
     VERDICT="对照组窗口内一次睡眠都没有 —— 要么盖子没合上，要么判据看不见合盖睡眠。这两种情况下实验组的结果都不作数"
   fi
 elif [ "$NEW_IDLE" -gt 0 ]; then
-  VERDICT="睡了：窗口内新增 $NEW_IDLE 次进入睡眠（Clamshell $NEW_CLAM），心跳最大断档 ${GAP}s。合盖期间 flag=1 约 ${ON_SECS}s、=0 约 ${OFF_SECS}s —— 先分清是「挡不住」还是「被重置」"
+  VERDICT="睡了：窗口内新增 $NEW_IDLE 次进入睡眠（Clamshell ${NEW_CLAM}），心跳最大断档 ${GAP}s。合盖期间 flag=1 约 ${ON_SECS}s、=0 约 ${OFF_SECS}s —— 先分清是「挡不住」还是「被重置」"
 elif [ "${GAP:-0}" -gt 5 ]; then
   VERDICT="没进睡眠但心跳断档 ${GAP}s —— 计时被冻过，去看 flag.tsv 与系统日志再定性"
 elif [ "$ON_SECS" -ge "$REQUIRED" ]; then
-  VERDICT="挡住合盖了：合盖 ${LID_SECS}s 里 flag=1 覆盖 ${ON_SECS}s（≥ 满格线 $REQUIRED 秒），零次进睡眠、心跳无断档（时长档位：$TIER）"
+  VERDICT="挡住合盖了：合盖 ${LID_SECS}s 里 flag=1 覆盖 ${ON_SECS}s（≥ 满格线 $REQUIRED 秒），零次进睡眠、心跳无断档（时长档位：${TIER}）"
 elif [ "$CLOSE_VAL" = "1" ] && [ "$OFF_SECS" -ge 30 ]; then
   VERDICT="这一轮没测「开着挡不挡得住」，但把坑 #2 从二手升级成本机实测：合盖那一刻 flag=1，随后 flag 被还原成 0，盖子继续合着 ${OFF_SECS}s，仍**零睡眠事件、心跳零断档**。也就是苹果只在合盖那一下判一次，还原不会补睡 —— §2.2 的守卫还原时必须自己补一次 sleepnow"
 elif [ "$FLAG_MIN" = "0" ]; then
-  VERDICT="不能判定「挡不住」：窗口内 SleepDisabled 掉回过 0（最小值 $FLAG_MIN、变化 $FLAG_FLIPS 次）。这测的是「会不会被重置」，得排除重置这一层再重测"
+  VERDICT="不能判定「挡不住」：窗口内 SleepDisabled 掉回过 0（最小值 ${FLAG_MIN}、变化 $FLAG_FLIPS 次）。这测的是「会不会被重置」，得排除重置这一层再重测"
 else
   VERDICT="合盖 ${LID_SECS}s 零睡眠事件，但 flag=1 只覆盖 ${ON_SECS}s（满格要 ≥$REQUIRED 秒），档位：$TIER —— 是正证据，只是窗口没跑满"
 fi
@@ -113,7 +113,7 @@ if [ "$CONTROL" = 1 ]; then CHANGED="对照组，全程未改动"; else CHANGED=
 if [ "$HAS_LID" = 0 ]; then
   LID_LINES="- 盖子状态：这一轮**没有 flag.tsv**（跑在该传感器加上之前），合盖时长与合盖期间的取值都无法自证 —— 下面只按事件与心跳判。"
 else
-  LID_LINES="- 盖子状态：合上采样 $FLAG_SAMPLES 次 ≈ $LID_SECS 秒（满格需 ≥ ${REQUIRED}s，本次档位：$TIER；$([ "$LID_ENOUGH" = 1 ] && echo "达标，可用" || echo "低于 30 秒下限，本次不作数")）
+  LID_LINES="- 盖子状态：合上采样 $FLAG_SAMPLES 次 ≈ $LID_SECS 秒（满格需 ≥ ${REQUIRED}s，本次档位：${TIER}；$([ "$LID_ENOUGH" = 1 ] && echo "达标，可用" || echo "低于 30 秒下限，本次不作数")）
 - **合盖那一刻的取值：${CLOSE_VAL:-?}** —— 这条决定这一轮到底在回答哪个问题
 - 合盖期间取值：flag=1 约 ${ON_SECS}s / flag=0 约 ${OFF_SECS}s；最小 **$FLAG_MIN**，取值变化 **$FLAG_FLIPS** 次"
 fi
@@ -121,10 +121,10 @@ fi
 # 合盖实测报告 $(TS)　$([ "$CONTROL" = 1 ] && echo "对照组" || echo "实验组 $([ "$CONTROL" = "?" ] && echo "（meta 未记，按实验组算）")")
 
 - 采样：$HB_N 个心跳，$(DHS "${HB_FIRST:-0}") → $(DHS "${HB_LAST:-0}")（$MINUTES 分钟档）$MINUTES_NOTE$EARLY
-- SleepDisabled：基线 ${BASE_SLEEP:-?}，$CHANGED（分析时 $(VAL)）
+- SleepDisabled：基线 ${BASE_SLEEP:-?}，${CHANGED}（分析时 $(VAL)）
 $LID_LINES
-- Clamshell Sleep 事件：基线 ${CLAM_BEFORE:-?} → 现存 $CLAM_NOW；**窗口内新增 $NEW_CLAM**（按日志时间戳数进窗口的）
-- 进入睡眠事件（全部原因）：基线 ${IDLE_BEFORE:-未记} → 现存 $IDLE_NOW；**窗口内新增 $NEW_IDLE**
+- Clamshell Sleep 事件：基线 ${CLAM_BEFORE:-?} → 现存 ${CLAM_NOW}；**窗口内新增 $NEW_CLAM**（按日志时间戳数进窗口的）
+- 进入睡眠事件（全部原因）：基线 ${IDLE_BEFORE:-未记} → 现存 ${IDLE_NOW}；**窗口内新增 $NEW_IDLE**
 - 心跳最大断档：**${GAP:-?}s**
 - 抓屏：成功 $FRAMES_OK 次 / 失败 $FRAMES_FAIL 次（每张只记大小，每 6 张留一张）
 

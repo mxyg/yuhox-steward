@@ -15,8 +15,9 @@ CONTROL=0
 case "$MINUTES" in ''|*[!0-9]*) echo "分钟数得是整数（例：$0 3）"; exit 1 ;; esac
 [ "$MINUTES" -lt 1 ] && { echo "至少 1 分钟，否则合盖动作来不及发生"; exit 1; }
 HERE="$(cd "$(dirname "$0")" && pwd)"
+# 目录名就是这一轮的时间戳。**这里不 mkdir** —— 被单实例锁挡下的启动什么也不该留下
+# （之前落过三个 0 字节空目录，全是一次次"没起成的起跑"造的）。
 OUT="$HERE/输出/$(date +%Y%m%d-%H%M%S)"
-mkdir -p "$OUT/frames"
 
 TS() { date '+%Y-%m-%d %H:%M:%S'; }
 NOW() { date +%s; }
@@ -49,6 +50,7 @@ if [ -z "${LIDPROBE_BG:-}" ]; then
   fi
   ARGS="$MINUTES"
   [ "$CONTROL" = 1 ] && ARGS="$MINUTES --control"
+  mkdir -p "$OUT/frames"   # progress.log 要落在这里，起后台那一半之前建
   LIDPROBE_BG=1 LIDPROBE_OUT="$OUT" nohup bash "$HERE/lidprobe.sh" $ARGS </dev/null >"$OUT/progress.log" 2>&1 &
   # 锁先按子进程 pid 占上：前台这一下退出得太快，等子进程自己写会露出一瞬的空档，
   # 连敲两次命令就能起两轮 —— 那正是取消标记互相踩的成因。子进程起来会重写同一个值。
@@ -56,7 +58,19 @@ if [ -z "${LIDPROBE_BG:-}" ]; then
   echo "$(TS) 已后台起跑（pid $!）：终端关掉、远程掉线都不影响这一轮。"
   echo "     进度： tail -f '$OUT/progress.log'"
   echo "     报告： $OUT/报告.md（跑完自动生成，中途退出也有）"
-  echo "     屏幕上会弹**一次**系统授权框，先点它再合盖。"
+  if [ "$CONTROL" = 1 ]; then
+    echo "     对照组不改任何设置：看到这行就可以合盖了，满 ${MINUTES} 分钟再打开。"
+    exit 0
+  fi
+  # 前台这一半不等整轮，只等「取值真的变成 1」那一下 —— 因为合盖的时机必须由人对着屏幕上的
+  # 那一行做，不能让他在不知道开没开的情况下赌。等不到也没关系：后台那一半自己判未起跑并还原。
+  echo "     屏幕上会弹**一次**系统授权框：先点它，取值到 1 我叫你合盖。"
+  for _ in $(seq 1 100); do
+    [ "$(VAL)" = "1" ] && { echo "$(TS) 已开启（SleepDisabled=1）—— 现在合上盖子，全程保持合上满 ${MINUTES} 分钟再打开。"; break; }
+    kill -0 "$!" 2>/dev/null || { echo "$(TS) 后台那一半已退出（多半是授权没给），原因见 $OUT/报告.md"; break; }
+    sleep 1
+  done
+  [ "$(VAL)" = "1" ] || echo "$(TS) 没等到取值变 1；这一轮不作数，机器状态以报告里那行为准。"
   exit 0
 fi
 # 这一半已经是 nohup 起来的子进程：锁的值由前台按本进程 pid 提前占好，不会再被抢，
@@ -191,7 +205,7 @@ FR=$!
   done > "$OUT/flag.tsv" ) &
 FL=$!
 
-echo "$(TS) 基线：SleepDisabled=$BASE_SLEEP，历史 Clamshell Sleep 事件 $CLAM_BEFORE 条"
+echo "$(TS) 基线：SleepDisabled=${BASE_SLEEP}，历史 Clamshell Sleep 事件 $CLAM_BEFORE 条"
 if [ "$CONTROL" = 1 ]; then
   echo "$(TS) 对照组：请在 15 秒内合上盖子，**全程保持合上**满 ${MINUTES} 分钟再打开（中途开盖本次作废）。"
 else

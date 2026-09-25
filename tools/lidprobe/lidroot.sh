@@ -17,7 +17,7 @@ PARENT="${3:-}"
 # pyenv/homebrew shim 全都不在 —— 所以工具一律写绝对路径，别赌它找得到。
 PMSET=/usr/bin/pmset; IOREG=/usr/sbin/ioreg; AWK=/usr/bin/awk; DATE=/bin/date
 for _t in "$PMSET" "$IOREG" "$AWK" "$DATE"; do
-  [ -x "$_t" ] || { echo "$(date '+%H:%M:%S') [root] 缺少 $_t，无法继续"; exit 2; }
+  [ -x "$_t" ] || { echo "$(date '+%H:%M:%S') [root] 缺少 ${_t}，无法继续"; exit 2; }
 done
 
 LID() { "$IOREG" -r -k AppleClamshellState -d 1 2>/dev/null | "$AWK" -F'= ' '/AppleClamshellState/{gsub(/[ "]/,"",$2); print $2; exit}'; }
